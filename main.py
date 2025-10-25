@@ -64,7 +64,6 @@ def safe_request(method: str, endpoint: str, **kwargs) -> Any:
     return {"error": f"Max retries reached for {endpoint}"}
 
 
-@lru_cache(maxsize=128)
 def fd_get(endpoint: str, params: dict = None) -> Any:
     """GET request with cache that supports dict params (fix for unhashable dict)."""
     frozen_params = frozenset(params.items()) if params else None
@@ -231,3 +230,4 @@ if __name__ == "__main__":
     print("🟢 SSE Handshake: /sse/")
     print("=" * 60)
     server.run(transport="sse", host="0.0.0.0", port=8001)
+
