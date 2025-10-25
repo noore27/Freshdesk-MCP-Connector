@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """
-Freshdesk MCP Connector - Full Version
+Freshdesk MCP Connector - v7.0 Stable
 Author: Nuri Muhammet Birlik
-Version: 6.3
+Description: MCP connector for Freshdesk – compatible with all plans (free & paid).
 """
 
 import os
 import requests
 import logging
+import time
 from typing import Dict, List, Any
 from fastmcp import FastMCP
 from dotenv import load_dotenv
+from functools import lru_cache
 
 # -------------------------------------------------------
 # Logging Setup
@@ -19,151 +21,125 @@ LOG_FILE = "freshdesk_mcp.log"
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FILE),
-        logging.StreamHandler()
-    ]
+    handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler()]
 )
 logger = logging.getLogger("FreshdeskMCP")
 
 # -------------------------------------------------------
-# Load .env
+# Load environment
 # -------------------------------------------------------
 load_dotenv()
-FRESHDESK_DOMAIN = os.getenv("FRESHDESK_DOMAIN")  # e.g. yourcompany.freshdesk.com
+FRESHDESK_DOMAIN = os.getenv("FRESHDESK_DOMAIN", "").replace("https://", "").replace("http://", "").strip("/")
 FRESHDESK_API_KEY = os.getenv("FRESHDESK_API_KEY")
 
 if not FRESHDESK_DOMAIN or not FRESHDESK_API_KEY:
-    raise ValueError("❌ Missing FRESHDESK_DOMAIN or FRESHDESK_API_KEY in .env file")
+    raise ValueError("❌ Missing FRESHDESK_DOMAIN or FRESHDESK_API_KEY in environment variables")
 
 BASE_URL = f"https://{FRESHDESK_DOMAIN}/api/v2"
 
 # -------------------------------------------------------
 # Helper Functions
 # -------------------------------------------------------
+def safe_request(method: str, endpoint: str, **kwargs) -> Any:
+    """Universal request handler with retry logic."""
+    retries = 3
+    for attempt in range(retries):
+        try:
+            url = f"{BASE_URL}/{endpoint}"
+            r = requests.request(
+                method,
+                url,
+                auth=(FRESHDESK_API_KEY, "X"),
+                timeout=20,
+                **kwargs
+            )
+            if r.status_code == 429:
+                time.sleep(2)
+                continue
+            r.raise_for_status()
+            return r.json()
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"Attempt {attempt+1}/{retries} failed: {e}")
+            time.sleep(2)
+    return {"error": f"Max retries reached for {endpoint}"}
+
+
+@lru_cache(maxsize=128)
 def fd_get(endpoint: str, params: dict = None) -> Any:
-    """Generic GET request for Freshdesk API."""
-    try:
-        r = requests.get(
-            f"{BASE_URL}/{endpoint}",
-            params=params,
-            auth=(FRESHDESK_API_KEY, "X"),
-            timeout=20
-        )
-        r.raise_for_status()
-        return r.json()
-    except requests.exceptions.HTTPError as e:
-        logger.error(f"HTTP {r.status_code}: {r.text}")
-        return {"error": f"HTTP {r.status_code}: {r.text}"}
-    except Exception as e:
-        logger.error(str(e))
-        return {"error": str(e)}
+    """GET request with cache."""
+    return safe_request("GET", endpoint, params=params)
 
 
 def fd_post(endpoint: str, data: dict) -> Any:
-    """Generic POST request."""
-    try:
-        r = requests.post(
-            f"{BASE_URL}/{endpoint}",
-            json=data,
-            auth=(FRESHDESK_API_KEY, "X"),
-            timeout=20
-        )
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        logger.error(f"POST {endpoint} failed: {e}")
-        return {"error": str(e)}
+    """POST request."""
+    return safe_request("POST", endpoint, json=data)
 
 
 def fd_put(endpoint: str, data: dict) -> Any:
-    """Generic PUT request."""
-    try:
-        r = requests.put(
-            f"{BASE_URL}/{endpoint}",
-            json=data,
-            auth=(FRESHDESK_API_KEY, "X"),
-            timeout=20
-        )
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        logger.error(f"PUT {endpoint} failed: {e}")
-        return {"error": str(e)}
-
-# -------------------------------------------------------
-# Pagination Helper
-# -------------------------------------------------------
-def paginate_tickets(query: str = None, per_page: int = 50, max_pages: int = 5) -> List[Dict[str, Any]]:
-    """Handle Freshdesk search pagination."""
-    all_tickets = []
-    page = 1
-
-    while page <= max_pages:
-        params = {"page": page, "per_page": per_page}
-        if query:
-            params["query"] = f'"{query}"'
-        data = fd_get("search/tickets", params=params)
-        if "error" in data:
-            break
-        tickets = data.get("results", [])
-        if not tickets:
-            break
-        all_tickets.extend(tickets)
-        if len(tickets) < per_page:
-            break
-        page += 1
-
-    return all_tickets
+    """PUT request."""
+    return safe_request("PUT", endpoint, json=data)
 
 # -------------------------------------------------------
 # Initialize MCP Server
 # -------------------------------------------------------
 server = FastMCP(
     name="Freshdesk MCP Connector",
-    instructions="Access and search Freshdesk tickets and conversations via MCP tools."
+    instructions="Access, search, and manage Freshdesk tickets via MCP tools."
 )
 
 # -------------------------------------------------------
 # Tool: Overview
 # -------------------------------------------------------
-@server.tool()
+@server.tool(description="Get account overview including agents and groups")
 async def overview() -> Dict[str, Any]:
-    """Get basic information about the Freshdesk account."""
+    """Get basic Freshdesk account info."""
     company = {"domain": FRESHDESK_DOMAIN}
     agents = fd_get("agents")
     groups = fd_get("groups")
     return {"company": company, "agents": agents, "groups": groups}
 
 # -------------------------------------------------------
-# Tool: Search Tickets
+# Tool: Search (universal for all plans)
 # -------------------------------------------------------
-@server.tool()
+@server.tool(description="Search tickets by keyword (works in all plans)")
 async def search(query: str) -> Dict[str, Any]:
-    """Search Freshdesk tickets by keyword."""
+    """Search Freshdesk tickets by keyword in subject or description."""
     if not query.strip():
         return {"results": []}
 
-    tickets = paginate_tickets(query)
-    results = [{
-        "id": t.get("id"),
-        "subject": t.get("subject"),
-        "description": (t.get("description_text", "")[:200] + "..."),
-        "status": t.get("status"),
-        "priority": t.get("priority"),
-        "created_at": t.get("created_at"),
-        "updated_at": t.get("updated_at"),
-        "url": f"https://{FRESHDESK_DOMAIN}/a/tickets/{t.get('id')}"
-    } for t in tickets]
+    # 1️⃣ Try the search API first (only works on paid plans)
+    data = fd_get("search/tickets", params={"query": f'"{query}"'})
 
+    # 2️⃣ Fallback to /tickets if search is restricted
+    tickets = []
+    if isinstance(data, dict) and "error" in data:
+        logger.warning("Search endpoint unavailable, falling back to /tickets")
+        tickets = fd_get("tickets")
+    else:
+        tickets = data.get("results", data)
+
+    if not tickets:
+        return {"results": []}
+
+    results = []
+    for t in tickets:
+        subject = (t.get("subject") or "").lower()
+        desc = (t.get("description_text") or t.get("description") or "").lower()
+        if query.lower() in subject or query.lower() in desc:
+            results.append({
+                "id": t.get("id"),
+                "subject": t.get("subject", "No Subject"),
+                "status": t.get("status"),
+                "priority": t.get("priority"),
+                "url": f"https://{FRESHDESK_DOMAIN}/a/tickets/{t.get('id')}"
+            })
     return {"results": results}
 
 # -------------------------------------------------------
-# Tool: Fetch Ticket Details
+# Tool: Fetch Ticket
 # -------------------------------------------------------
-@server.tool()
+@server.tool(description="Fetch detailed info about a specific ticket")
 async def fetch(ticket_id: int) -> Dict[str, Any]:
-    """Retrieve full details of a Freshdesk ticket."""
     ticket = fd_get(f"tickets/{ticket_id}")
     if "error" in ticket:
         return ticket
@@ -181,30 +157,16 @@ async def fetch(ticket_id: int) -> Dict[str, Any]:
         "type": ticket.get("type"),
         "created_at": ticket.get("created_at"),
         "updated_at": ticket.get("updated_at"),
-        "requester_id": ticket.get("requester_id"),
-        "responder_id": ticket.get("responder_id"),
-        "group_id": ticket.get("group_id"),
-        "tags": ticket.get("tags", []),
-        "conversations": [{
-            "id": c.get("id"),
-            "body_text": c.get("body_text", ""),
-            "from_email": c.get("from_email"),
-            "to_emails": c.get("to_emails"),
-            "incoming": c.get("incoming"),
-            "created_at": c.get("created_at")
-        } for c in conversations],
-        "metadata": {
-            "source": "freshdesk",
-            "url": f"https://{FRESHDESK_DOMAIN}/a/tickets/{ticket_id}"
-        }
+        "conversations": conversations,
+        "url": f"https://{FRESHDESK_DOMAIN}/a/tickets/{ticket_id}"
     }
 
 # -------------------------------------------------------
 # Tool: Create Ticket
 # -------------------------------------------------------
-@server.tool()
-async def create_ticket(email: str, subject: str, description: str, priority: int = 1, status: int = 2) -> Dict[str, Any]:
-    """Create a new Freshdesk ticket."""
+@server.tool(description="Create a new Freshdesk ticket")
+async def create_ticket(email: str, subject: str, description: str, priority: int = 1, status: int = 2):
+    """Create new ticket."""
     data = {
         "email": email,
         "subject": subject,
@@ -217,54 +179,48 @@ async def create_ticket(email: str, subject: str, description: str, priority: in
 # -------------------------------------------------------
 # Tool: Update Ticket
 # -------------------------------------------------------
-@server.tool()
-async def update_ticket(ticket_id: int, status: int = None, priority: int = None, description: str = None) -> Dict[str, Any]:
-    """Update ticket fields."""
+@server.tool(description="Update ticket status, priority, or description")
+async def update_ticket(ticket_id: int, status: int = None, priority: int = None, description: str = None):
     data = {}
-    if status is not None: data["status"] = status
-    if priority is not None: data["priority"] = priority
-    if description: data["description"] = description
+    if status is not None:
+        data["status"] = status
+    if priority is not None:
+        data["priority"] = priority
+    if description:
+        data["description"] = description
     return fd_put(f"tickets/{ticket_id}", data)
 
 # -------------------------------------------------------
-# Tool: Reply to Ticket
+# Tool: Reply
 # -------------------------------------------------------
-@server.tool()
-async def reply(ticket_id: int, body: str, private: bool = False) -> Dict[str, Any]:
-    """Reply or add a private note to a ticket."""
+@server.tool(description="Reply or add a private note to a ticket")
+async def reply(ticket_id: int, body: str, private: bool = False):
+    """Reply to a ticket."""
     data = {"body": body, "private": private}
     return fd_post(f"tickets/{ticket_id}/reply", data)
 
 # -------------------------------------------------------
 # Tool: Close Ticket
 # -------------------------------------------------------
-@server.tool()
-async def close_ticket(ticket_id: int) -> Dict[str, Any]:
-    """Close a ticket (status = 5)."""
+@server.tool(description="Close a ticket (set status = 5)")
+async def close_ticket(ticket_id: int):
+    """Close ticket."""
     return fd_put(f"tickets/{ticket_id}", {"status": 5})
 
 # -------------------------------------------------------
-# Run
+# Tool: Health Check
+# -------------------------------------------------------
+@server.tool(description="Ping the connector to verify it's running")
+async def ping() -> Dict[str, str]:
+    """Simple health check."""
+    return {"status": "ok", "domain": FRESHDESK_DOMAIN}
+
+# -------------------------------------------------------
+# Run Server
 # -------------------------------------------------------
 if __name__ == "__main__":
-    print("🚀 Starting Freshdesk MCP server on http://localhost:8001")
+    print("🚀 Starting Freshdesk MCP Connector on http://localhost:8001")
     print("🌐 MCP Discovery: http://localhost:8001/.well-known/mcp")
     print("🟢 SSE Handshake: /sse/")
-    print("\n🔧 Registered Tools:")
-
-    try:
-        loaded_tools = getattr(server, "_tools", getattr(server, "registry", {}))
-        if loaded_tools:
-            for tool_name, tool_data in loaded_tools.items():
-                desc = getattr(tool_data, "description", "No description")
-                print(f"   🛠️  {tool_name} → {desc}")
-                logger.info(f"Tool loaded: {tool_name}")
-            print(f"\n✅ Total Tools Loaded: {len(loaded_tools)}")
-        else:
-            print("⚠️ No tools found. Check @server.tool() decorators.")
-    except Exception as e:
-        print(f"❌ Error listing tools: {e}")
-        logger.error(f"Error listing tools: {e}")
-
     print("=" * 60)
     server.run(transport="sse", host="0.0.0.0", port=8001)
