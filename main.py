@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Freshdesk MCP Connector - v7.0 Stable
+Freshdesk MCP Connector - v7.1 Final Stable
 Author: Nuri Muhammet Birlik
 Description: MCP connector for Freshdesk – compatible with all plans (free & paid).
 """
@@ -66,8 +66,9 @@ def safe_request(method: str, endpoint: str, **kwargs) -> Any:
 
 @lru_cache(maxsize=128)
 def fd_get(endpoint: str, params: dict = None) -> Any:
-    """GET request with cache."""
-    return safe_request("GET", endpoint, params=params)
+    """GET request with cache that supports dict params (fix for unhashable dict)."""
+    frozen_params = frozenset(params.items()) if params else None
+    return safe_request("GET", endpoint, params=dict(frozen_params) if frozen_params else None)
 
 
 def fd_post(endpoint: str, data: dict) -> Any:
@@ -107,33 +108,39 @@ async def search(query: str) -> Dict[str, Any]:
     if not query.strip():
         return {"results": []}
 
-    # 1️⃣ Try the search API first (only works on paid plans)
-    data = fd_get("search/tickets", params={"query": f'"{query}"'})
+    try:
+        # 1️⃣ Try the search API first (only works on paid plans)
+        data = fd_get("search/tickets", params={"query": f'"{query}"'})
 
-    # 2️⃣ Fallback to /tickets if search is restricted
-    tickets = []
-    if isinstance(data, dict) and "error" in data:
-        logger.warning("Search endpoint unavailable, falling back to /tickets")
-        tickets = fd_get("tickets")
-    else:
-        tickets = data.get("results", data)
+        # 2️⃣ Fallback to /tickets if search is restricted
+        tickets = []
+        if isinstance(data, dict) and "error" in data:
+            logger.warning("Search endpoint unavailable, falling back to /tickets")
+            tickets = fd_get("tickets")
+        else:
+            tickets = data.get("results", data)
 
-    if not tickets:
-        return {"results": []}
+        if not tickets:
+            return {"results": []}
 
-    results = []
-    for t in tickets:
-        subject = (t.get("subject") or "").lower()
-        desc = (t.get("description_text") or t.get("description") or "").lower()
-        if query.lower() in subject or query.lower() in desc:
-            results.append({
-                "id": t.get("id"),
-                "subject": t.get("subject", "No Subject"),
-                "status": t.get("status"),
-                "priority": t.get("priority"),
-                "url": f"https://{FRESHDESK_DOMAIN}/a/tickets/{t.get('id')}"
-            })
-    return {"results": results}
+        results = []
+        for t in tickets:
+            subject = (t.get("subject") or "").lower()
+            desc = (t.get("description_text") or t.get("description") or "").lower()
+            if query.lower() in subject or query.lower() in desc:
+                results.append({
+                    "id": t.get("id"),
+                    "subject": t.get("subject", "No Subject"),
+                    "status": t.get("status"),
+                    "priority": t.get("priority"),
+                    "url": f"https://{FRESHDESK_DOMAIN}/a/tickets/{t.get('id')}"
+                })
+
+        return {"results": results}
+
+    except Exception as e:
+        logger.error(f"Search failed: {e}")
+        return {"error": str(e)}
 
 # -------------------------------------------------------
 # Tool: Fetch Ticket
